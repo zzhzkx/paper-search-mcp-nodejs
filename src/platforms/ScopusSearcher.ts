@@ -12,7 +12,7 @@
  * Scopus is the largest abstract and citation database of peer-reviewed literature
  */
 
-import axios, { AxiosInstance } from 'axios';
+import axios, { AxiosInstance, AxiosResponse } from 'axios';
 import { PaperSource, SearchOptions, DownloadOptions, PlatformCapabilities } from './PaperSource.js';
 import { Paper, PaperFactory } from '../models/Paper.js';
 import { RateLimiter } from '../utils/RateLimiter.js';
@@ -227,18 +227,39 @@ export class ScopusSearcher extends PaperSource {
       await this.rateLimiter.waitForPermission();
       this.quotaManager.checkQuota('scopus');
 
-      const response = await ErrorHandler.retryWithBackoff(
-        () => this.client.get<ScopusSearchResponse>('/content/search/scopus', {
-          params: {
-            query: searchQuery,
-            count: maxResults,
-            start: 0,
-            view: 'COMPLETE',
-            field: 'dc:identifier,dc:title,dc:creator,prism:publicationName,prism:coverDate,prism:doi,prism:url,prism:volume,prism:issueIdentifier,prism:pageRange,citedby-count,dc:description,authkeywords,author,affiliation,openaccess,eid'
+      // The COMPLETE view returns richer fields (full author list, keywords) but
+      // requires a COMPLETE-view entitlement. When the key only has STANDARD access,
+      // Elsevier rejects COMPLETE with 401, so fall back to STANDARD automatically.
+      const scopusViews = ['COMPLETE', 'STANDARD'];
+      const requestedFields = 'dc:identifier,dc:title,dc:creator,prism:publicationName,prism:coverDate,prism:doi,prism:url,prism:volume,prism:issueIdentifier,prism:pageRange,citedby-count,dc:description,authkeywords,author,affiliation,openaccess,eid';
+
+      let response: AxiosResponse<ScopusSearchResponse> | null = null;
+      for (const view of scopusViews) {
+        try {
+          response = await ErrorHandler.retryWithBackoff(
+            () => this.client.get<ScopusSearchResponse>('/content/search/scopus', {
+              params: {
+                query: searchQuery,
+                count: maxResults,
+                start: 0,
+                view,
+                field: requestedFields
+              }
+            }),
+            { context: `Scopus search (${view} view)` }
+          );
+          break;
+        } catch (error: any) {
+          // 401 means the view is not entitled for this key; try the next one down.
+          if (error?.response?.status === 401 && view === 'COMPLETE') {
+            continue;
           }
-        }),
-        { context: 'Scopus search' }
-      );
+          throw error;
+        }
+      }
+      if (!response) {
+        throw new Error('Scopus search failed with all available views');
+      }
 
       this.quotaManager.incrementUsage('scopus');
 
