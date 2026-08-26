@@ -3,12 +3,15 @@
  * 基于HTML解析，包含反检测机制、会话管理和代理支持
  */
 
-import axios from 'axios';
+import { execFile, execFileSync } from 'child_process';
+import { promisify } from 'util';
 import * as cheerio from 'cheerio';
 import { Paper, PaperFactory } from '../models/Paper.js';
 import { PaperSource, SearchOptions, DownloadOptions, PlatformCapabilities } from './PaperSource.js';
 import { TIMEOUTS } from '../config/constants.js';
 import { logDebug } from '../utils/Logger.js';
+
+const execFileAsync = promisify(execFile);
 
 interface GoogleScholarOptions extends SearchOptions {
   /** 语言设置 */
@@ -32,8 +35,11 @@ export class GoogleScholarSearcher extends PaperSource {
   private consecutiveFailures: number = 0;
   private readonly maxRetries = 3;
   private readonly baseDelay = 3000;
-  // Optional proxy support: set SCHOLAR_PROXY=http://user:pass@host:port to bypass IP-based blocking
-  private readonly proxy: string | undefined = process.env.SCHOLAR_PROXY || process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
+  // Proxy for Google Scholar access. Priority: SCHOLAR_PROXY > HTTPS_PROXY > HTTP_PROXY,
+  // falling back to the host's configured proxy (127.0.0.1:7897), since scholar.google.com
+  // is typically only reachable through the local proxy on this machine.
+  private readonly proxy: string | undefined =
+    process.env.SCHOLAR_PROXY || process.env.HTTPS_PROXY || process.env.HTTP_PROXY || this.detectSystemProxy();
 
   constructor() {
     super('google_scholar', 'https://scholar.google.com');
@@ -71,7 +77,7 @@ export class GoogleScholarSearcher extends PaperSource {
         await this.adaptiveDelay();
 
         const params = this.buildSearchParams(query, start, options);
-        const response = await this.makeScholarRequest(params);
+        const response = await this.retryRequest(params);
 
         if (response.status === 429 || response.status === 403) {
           logDebug(`Google Scholar rate limited (HTTP ${response.status}), resetting session...`);
@@ -137,29 +143,25 @@ export class GoogleScholarSearcher extends PaperSource {
   private async initializeSession(): Promise<void> {
     try {
       const userAgent = this.getRandomUserAgent();
-      const response = await axios.get('https://scholar.google.com', {
-        headers: {
-          'User-Agent': userAgent,
-          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-          'Accept-Language': 'en-US,en;q=0.9',
-          'Accept-Encoding': 'gzip, deflate, br',
-          'Connection': 'keep-alive',
-          'Cache-Control': 'no-cache',
-          'Pragma': 'no-cache'
-        },
-        timeout: TIMEOUTS.DEFAULT,
-        maxRedirects: 5,
-        ...(this.proxy ? { proxy: false, httpsAgent: this.buildProxyAgent() } : {})
-      });
+      const result = await this.runCurl('https://scholar.google.com', {
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Connection': 'keep-alive',
+        'Cache-Control': 'no-cache',
+        'Pragma': 'no-cache'
+      }, userAgent, true);
 
-      const setCookie = response.headers['set-cookie'];
-      if (setCookie) {
-        this.sessionCookies = (Array.isArray(setCookie) ? setCookie : [setCookie])
-          .map(c => c.split(';')[0])
+      // Extract Set-Cookie headers from the raw header block
+      const setCookie = result.rawHeaders.match(/^Set-Cookie:\s*(.*)$/gmi) || [];
+      if (setCookie.length > 0) {
+        this.sessionCookies = setCookie
+          .map(c => c.replace(/^Set-Cookie:\s*/i, '').split(';')[0].trim())
+          .filter(c => c.length > 0)
           .join('; ');
         logDebug('Google Scholar session initialized');
       }
-    } catch (error) {
+    } catch (error: any) {
       logDebug('Failed to initialize Google Scholar session, continuing without cookies');
     }
   }
@@ -214,8 +216,12 @@ export class GoogleScholarSearcher extends PaperSource {
   /**
    * 发起Scholar请求（不自动重试，由search方法控制重试逻辑）
    */
-  private async makeScholarRequest(params: Record<string, any>): Promise<any> {
+  private async makeScholarRequest(params: Record<string, any>): Promise<{ status: number; data: string; rawHeaders: string }> {
     const userAgent = this.getRandomUserAgent();
+
+    const queryString = new URLSearchParams(
+      Object.entries(params).filter(([, v]) => v !== undefined && v !== '')
+    ).toString();
 
     const headers: Record<string, string> = {
       'User-Agent': userAgent,
@@ -237,37 +243,102 @@ export class GoogleScholarSearcher extends PaperSource {
       headers['Cookie'] = this.sessionCookies;
     }
 
-    const config: any = {
-      params,
-      headers,
-      timeout: TIMEOUTS.DEFAULT,
-      maxRedirects: 5,
-      validateStatus: (status: number) => true,
-      ...(this.proxy ? { proxy: false, httpsAgent: this.buildProxyAgent() } : {})
-    };
+    const url = `${this.scholarUrl}?${queryString}`;
+    logDebug(`Google Scholar Request: GET ${url}`);
 
-    logDebug(`Google Scholar Request: GET ${this.scholarUrl}`);
-
-    return await axios.get(this.scholarUrl, config);
+    return await this.runCurl(url, headers, userAgent, false);
   }
 
   /**
-   * 构建代理Agent（支持http/https/socks代理）
+   * 带重试地发送一次 Scholar 请求。针对代理链路抖动（TLS 握手失败、空响应）做容错。
+   * 仅对网络异常（抛错）和"HTTP 200 但 body 为空"重试；HTTP 业务状态码（302/403/429 等）
+   * 直接返回给 search 方法处理，避免在限流等状态上盲目重试。
    */
-  private buildProxyAgent(): any {
-    if (!this.proxy) return undefined;
-    try {
-      const u = new URL(this.proxy);
-      const proto = u.protocol.replace(':', '');
-      const agentMod = proto === 'https' ? 'https-proxy-agent' : proto === 'socks' || proto.startsWith('socks') ? 'socks-proxy-agent' : 'http-proxy-agent';
-      // lazy require to avoid hard dependency
-      const Agent = require(agentMod);
-      const AgentClass = Agent.HttpsProxyAgent || Agent.SocksProxyAgent || Agent.HttpProxyAgent || Agent.default || Agent;
-      return new AgentClass(this.proxy);
-    } catch (error: any) {
-      logDebug(`Failed to build proxy agent for ${this.proxy}: ${error.message}`);
-      return undefined;
+  private async retryRequest(params: Record<string, any>): Promise<{ status: number; data: string; rawHeaders: string }> {
+    let lastError: string = '';
+    for (let attempt = 0; attempt < this.maxRetries; attempt++) {
+      try {
+        const response = await this.makeScholarRequest(params);
+        const hasBody = response.data && response.data.trim().length > 0;
+        // 200 且有内容 => 成功；其它状态码 => 交给 search 处理
+        if (response.status !== 200 || hasBody) {
+          return response;
+        }
+        lastError = 'empty response body';
+        logDebug(`Google Scholar empty response, retry ${attempt + 1}/${this.maxRetries}`);
+        await this.randomDelay(3000, 6000);
+      } catch (error: any) {
+        lastError = error.message || String(error);
+        logDebug(`Google Scholar request error, retry ${attempt + 1}/${this.maxRetries}: ${lastError}`);
+        await this.randomDelay(3000, 6000);
+      }
     }
+    throw new Error(`Google Scholar request failed after ${this.maxRetries} attempts: ${lastError}`);
+  }
+
+  /**
+   * 通过系统 curl 发起请求。Google Scholar 对 Node 默认 TLS 指纹会限流（429），
+   * 而 curl 的指纹更接近普通客户端，实测走代理可稳定返回 200 + 真实结果。
+   * @returns { status, data, rawHeaders } — data 为页面 HTML，rawHeaders 仅在 captureHeaders 时非空
+   */
+  private async runCurl(
+    url: string,
+    headers: Record<string, string>,
+    userAgent: string,
+    captureHeaders: boolean
+  ): Promise<{ status: number; data: string; rawHeaders: string }> {
+    const headersWithUA: Record<string, string> = { 'User-Agent': userAgent, ...headers };
+
+    const args: string[] = ['-sS', '-L', '--compressed', '--max-time', String(Math.floor(TIMEOUTS.DEFAULT / 1000))];
+    if (this.proxy) {
+      args.push('-x', this.proxy.replace(/^https?:\/\//, ''));
+    }
+    for (const [k, v] of Object.entries(headersWithUA)) {
+      args.push('-H', `${k}: ${v}`);
+    }
+
+    if (captureHeaders) {
+      // 响应头输出到 stdout，body 丢弃
+      const nullDevice = process.platform === 'win32' ? 'NUL' : '/dev/null';
+      args.push('-D', '-', '-o', nullDevice, url);
+      const { stdout } = await execFileAsync('curl', args, { windowsHide: true, maxBuffer: 10 * 1024 * 1024 });
+      const status = this.parseStatusFromHeaders(stdout);
+      return { status, data: '', rawHeaders: stdout };
+    }
+
+    // body 输出到 stdout，末尾追加状态码标记
+    args.push('-w', '\n__GS_STATUS__%{http_code}', url);
+    const { stdout } = await execFileAsync('curl', args, { windowsHide: true, maxBuffer: 10 * 1024 * 1024 });
+    const m = stdout.match(/__GS_STATUS__(\d+)\s*$/);
+    const status = m ? parseInt(m[1], 10) : 0;
+    const data = stdout.replace(/__GS_STATUS__\d+\s*$/, '');
+    return { status, data, rawHeaders: '' };
+  }
+
+  /**
+   * 从 curl -D 输出的原始响应头中解析状态码
+   */
+  private parseStatusFromHeaders(rawHeaders: string): number {
+    const m = rawHeaders.match(/^HTTP\/\S*\s+(\d{3})/im);
+    return m ? parseInt(m[1], 10) : 0;
+  }
+
+  /**
+   * 探测系统配置的代理（Windows 注册表 Internet Settings），回退到常见本地代理端口
+   */
+  private detectSystemProxy(): string | undefined {
+    try {
+      const out = execFileSync('reg', ['query', 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings', '/v', 'ProxyServer'], { encoding: 'utf8', windowsHide: true });
+      const m = out.match(/ProxyServer\s+REG_SZ\s+(\S+)/);
+      if (m) {
+        const server = m[1].trim();
+        return server.startsWith('http') ? server : `http://${server}`;
+      }
+    } catch {
+      // ignore
+    }
+    // 常见本地代理端口，作为最后回退
+    return 'http://127.0.0.1:7897';
   }
 
   /**
