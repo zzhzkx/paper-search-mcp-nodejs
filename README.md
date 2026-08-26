@@ -49,7 +49,7 @@ A Node.js Model Context Protocol (MCP) server for searching and downloading acad
 This project includes integrations that may have **legal, contractual (ToS), and ethical** constraints. You are responsible for ensuring your usage complies with applicable laws, institutional policies, and third‑party terms.
 
 - **Sci-Hub**: May provide access to copyrighted works without authorization in many jurisdictions. Use only when you have the legal right to access the content (e.g., open access, author‑provided copies, or licensed institutional access).
-- **Google Scholar**: This integration relies on automated fetching/parsing and may violate Google's Terms of Service or trigger blocking/rate limits. Prefer official APIs or metadata sources (e.g., Crossref, Semantic Scholar) when ToS compliance is required.
+- **Google Scholar**: This integration relies on automated fetching/parsing and may violate Google's Terms of Service or trigger blocking/rate limits. Requests are issued through a system `curl` subprocess (instead of Node's HTTP stack) to avoid TLS-fingerprint-based rate limiting, with session cookies, adaptive delays, and retries for transient proxy/network failures — searches are stable in practice as long as the host proxy can reach Google. Prefer official APIs or metadata sources (e.g., Crossref, Semantic Scholar) when ToS compliance is required.
 
 ## 🚀 Quick Start
 
